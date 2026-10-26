@@ -1,4 +1,4 @@
-# One sandbox instance. `sandbox` sets the compose project name per project,
+# One sandbox instance. `claude-sandbox` sets the compose project name per project,
 # HOST_UID/HOST_GID, and PROJECT_DIR, INSTANCE_DIR, INSTANCE_ID, DEV_PORT and
 # DEV_BIND from instances/<id>/instance.env.
 #
@@ -62,14 +62,14 @@ services:
       - type: bind
         source: ${PROJECT_DIR:?}
         target: /workspace
-      # Read-only overlays. .sandbox holds the project's allowlist and
+      # Read-only overlays. .claude-sandbox holds the project's allowlist and
       # toolchain. All of .git, because git on the host executes what's in it
       # (config can set core.fsmonitor, hooks run on commit); overlaying only
       # config/hooks isn't enough, since .git itself could then be renamed
       # and replaced. Being mount points, neither can be renamed or deleted.
       - type: bind
-        source: ${PROJECT_DIR}/.sandbox
-        target: /workspace/.sandbox
+        source: ${PROJECT_DIR}/.claude-sandbox
+        target: /workspace/.claude-sandbox
         read_only: true
       - type: bind
         source: ${PROJECT_DIR}/.git

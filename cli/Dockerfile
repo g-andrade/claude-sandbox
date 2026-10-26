@@ -1,6 +1,6 @@
 # The Claude Code binary in its glibc and musl builds, from the official
 # release channel, checksum-verified. Only a COPY source for the sandbox layer
-# (claude/Dockerfile). Update by rebuilding: sandbox rebuild
+# (claude/Dockerfile). Update by rebuilding: claude-sandbox rebuild
 FROM alpine:3.22 AS fetch
 ARG CLAUDE_CODE_VERSION=latest
 RUN apk add --no-cache curl jq

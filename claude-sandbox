@@ -9,7 +9,7 @@ SHARED_IMAGES=(claude-sandbox-proxy claude-sandbox-cli)
 
 usage() {
   cat <<'EOF'
-Usage: sandbox <command>
+Usage: claude-sandbox <command>
 
 Run inside a project (a git repository). Each project gets its own sandbox.
 
@@ -31,7 +31,7 @@ EOF
 }
 
 die() {
-  echo "sandbox: $*" >&2
+  echo "claude-sandbox: $*" >&2
   exit 1
 }
 
@@ -42,14 +42,14 @@ confirm() {
   [[ $answer == [yY] ]]
 }
 
-# Written to new projects' .sandbox/, and as the initial approved versions, so
+# Written to new projects' .claude-sandbox/, and as the initial approved versions, so
 # only changes a project makes need approval.
 default_allowlist() {
   cat <<EOF
 # Extra domains this project's sandbox may reach, on top of the shared list in
 # $TEMPLATE/proxy/allowlist.txt.
 # One per line; a leading dot also matches subdomains (.example.com).
-# Read-only inside the sandbox. Changes need your approval: sandbox reload
+# Read-only inside the sandbox. Changes need your approval: claude-sandbox reload
 #
 # Package registries, for example:
 #   JavaScript: registry.npmjs.org
@@ -61,9 +61,9 @@ EOF
 default_dockerfile() {
   cat <<'EOF'
 # Toolchain for this project's sandbox. Any image with a shell and apt, apk or
-# dnf works; sandbox adds Claude Code and the tools it needs on top. No COPY
+# dnf works; claude-sandbox adds Claude Code and the tools it needs on top. No COPY
 # from the project: this builds without a context. Read-only inside the
-# sandbox; changes need your approval and apply on the next `sandbox up`.
+# sandbox; changes need your approval and apply on the next `claude-sandbox up`.
 #
 # For example:
 #   FROM hexpm/elixir:1.20.4-erlang-28.5.0.8-debian-bookworm-20261005-slim
@@ -88,14 +88,14 @@ resolve_project() {
 
 require_instance() {
   resolve_project
-  [[ -f $INSTANCE_DIR/instance.env ]] || die "no sandbox for $PROJECT_DIR yet; start one with: sandbox up"
+  [[ -f $INSTANCE_DIR/instance.env ]] || die "no sandbox for $PROJECT_DIR yet; start one with: claude-sandbox up"
 }
 
 # For instances whose project directory is gone.
 select_instance() {
   ID=$1
   INSTANCE_DIR=$INSTANCES/$ID
-  [[ $ID =~ ^[a-z0-9-]+$ && -f $INSTANCE_DIR/instance.env ]] || die "no sandbox with id $ID (see: sandbox list)"
+  [[ $ID =~ ^[a-z0-9-]+$ && -f $INSTANCE_DIR/instance.env ]] || die "no sandbox with id $ID (see: claude-sandbox list)"
 }
 
 instance_var() {
@@ -156,7 +156,7 @@ INSTANCE_ID=$ID
 
 # Host port relayed to port 5173 inside the sandbox (run the dev server there
 # with --host). DEV_BIND=127.0.0.1 is this machine only; 0.0.0.0 also makes it
-# reachable from your LAN, e.g. a phone. Apply changes with: sandbox up
+# reachable from your LAN, e.g. a phone. Apply changes with: claude-sandbox up
 DEV_PORT=$port
 DEV_BIND=127.0.0.1
 EOF
@@ -178,12 +178,12 @@ prepare_project() {
   fi
   # A symlink here would let a cloned repo mount or show any host path.
   local path
-  for path in .sandbox .sandbox/allowlist.txt .sandbox/Dockerfile; do
+  for path in .claude-sandbox .claude-sandbox/allowlist.txt .claude-sandbox/Dockerfile; do
     [[ ! -L $PROJECT_DIR/$path ]] || die "$PROJECT_DIR/$path is a symlink; it must be a regular file or directory"
   done
-  mkdir -p "$PROJECT_DIR/.sandbox"
-  [[ -e $PROJECT_DIR/.sandbox/allowlist.txt ]] || default_allowlist >"$PROJECT_DIR/.sandbox/allowlist.txt"
-  [[ -e $PROJECT_DIR/.sandbox/Dockerfile ]] || default_dockerfile >"$PROJECT_DIR/.sandbox/Dockerfile"
+  mkdir -p "$PROJECT_DIR/.claude-sandbox"
+  [[ -e $PROJECT_DIR/.claude-sandbox/allowlist.txt ]] || default_allowlist >"$PROJECT_DIR/.claude-sandbox/allowlist.txt"
+  [[ -e $PROJECT_DIR/.claude-sandbox/Dockerfile ]] || default_dockerfile >"$PROJECT_DIR/.claude-sandbox/Dockerfile"
 }
 
 # Domains from an allowlist file: comments and blank lines dropped, sorted.
@@ -197,7 +197,7 @@ lines() {
 }
 
 # The sandbox only uses approved copies, in the instance directory, of the
-# project's .sandbox files. Asks before replacing one with the project's
+# project's .claude-sandbox files. Asks before replacing one with the project's
 # current content. Returns 1 when nothing changed.
 approve() {
   local file=$1 current=$2 approved=$3 previous
@@ -210,7 +210,7 @@ approve() {
 }
 
 approve_allowlist() {
-  local file=$PROJECT_DIR/.sandbox/allowlist.txt current invalid
+  local file=$PROJECT_DIR/.claude-sandbox/allowlist.txt current invalid
   current=$(domains "$file")
   # Each entry needs at least two labels, so "." or ".com" can't open up everything.
   invalid=$(grep -Eiv '^\.?([a-z0-9-]+\.)+[a-z0-9-]+$' <<<"$current" | grep -v '^$' || true)
@@ -219,7 +219,7 @@ approve_allowlist() {
 }
 
 approve_dockerfile() {
-  local file=$PROJECT_DIR/.sandbox/Dockerfile
+  local file=$PROJECT_DIR/.claude-sandbox/Dockerfile
   approve "$file" "$(cat "$file")" "$INSTANCE_DIR/Dockerfile.approved"
 }
 
@@ -279,7 +279,7 @@ verify() {
   check pass "Claude runs as your user, not root" claude '[ "$(id -u)" != 0 ]'
   check pass "Claude has no capabilities" claude \
     'grep -qE "^CapEff:[[:space:]]+0+$" /proc/self/status && grep -qE "^CapBnd:[[:space:]]+0+$" /proc/self/status'
-  check fail ".sandbox not writable" claude 'touch /workspace/.sandbox/x && rm /workspace/.sandbox/x'
+  check fail ".claude-sandbox not writable" claude 'touch /workspace/.claude-sandbox/x && rm /workspace/.claude-sandbox/x'
   check fail ".git not writable" claude 'touch /workspace/.git/x && rm /workspace/.git/x'
   check pass ".git is a mount point (can't be replaced)" claude \
     'grep -qE "^([^ ]+ ){4}/workspace/\.git ro[, ]" /proc/self/mountinfo'
@@ -307,9 +307,9 @@ Project:    $PROJECT_DIR
 Sandbox:    $ID
 Settings:   $INSTANCE_DIR/instance.env
 Dev server: http://$(instance_var DEV_BIND):$(instance_var DEV_PORT) -> port 5173 inside
-Toolchain:  $PROJECT_DIR/.sandbox/Dockerfile
+Toolchain:  $PROJECT_DIR/.claude-sandbox/Dockerfile
 Allowlists: $TEMPLATE/proxy/allowlist.txt
-            $PROJECT_DIR/.sandbox/allowlist.txt
+            $PROJECT_DIR/.claude-sandbox/allowlist.txt
 EOF
 }
 
@@ -334,7 +334,7 @@ remove() {
   compose --progress quiet down --volumes --remove-orphans
   docker image rm "claude-sandbox-claude:$ID" "claude-sandbox-toolchain:$ID" >/dev/null 2>&1 || true
   rm -rf -- "$INSTANCE_DIR"
-  echo "Deleted $ID. The project's .sandbox/ directory was left in place."
+  echo "Deleted $ID. The project's .claude-sandbox/ directory was left in place."
 }
 
 [[ -f $TEMPLATE/.env ]] || install -m 600 "$TEMPLATE/.env.example" "$TEMPLATE/.env"

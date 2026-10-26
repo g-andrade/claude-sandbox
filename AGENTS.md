@@ -2,14 +2,14 @@
 
 Template for per-project Claude Code sandboxes: Docker containers whose only
 network path out is a domain-allowlisting proxy, with nftables egress
-firewalls, and a toolchain image each project picks. `sandbox` (bash) creates
+firewalls, and a toolchain image each project picks. `claude-sandbox` (bash) creates
 and manages one instance per project. See README.md for the user-facing view.
 
 ## Layout
 
-- `sandbox`: the CLI; all instance logic lives here.
+- `claude-sandbox`: the CLI; all instance logic lives here.
 - `compose.yaml`: one instance, parameterised by `instances/<id>/instance.env`
-  plus `HOST_UID`/`HOST_GID` from `sandbox`. Services: `claude` (the project's
+  plus `HOST_UID`/`HOST_GID` from `claude-sandbox`. Services: `claude` (the project's
   image, untrusted), `claude-net` (owns claude's network namespace), `proxy`,
   `devport`.
 - `claude/Dockerfile`, `claude/install-layer`: the sandbox layer, built on top
@@ -30,7 +30,7 @@ and manages one instance per project. See README.md for the user-facing view.
 
 ## Security invariants
 
-Every change must keep these true. `sandbox verify` checks most of them.
+Every change must keep these true. `claude-sandbox verify` checks most of them.
 
 - The claude image is untrusted: projects choose its base, so isolation must
   never depend on its contents. Its user (the host UID), `cap_drop: [ALL]`
@@ -40,11 +40,11 @@ Every change must keep these true. `sandbox verify` checks most of them.
   is only on the `internal` network and whose firewall allows only the proxy.
 - Only `PROJECT_DIR` is mounted into the claude container: never this repo,
   `instances/`, the Docker socket, `~/.ssh` or host credentials.
-- `.git` and `.sandbox` are read-only mount points inside the container.
+- `.git` and `.claude-sandbox` are read-only mount points inside the container.
   Overlaying only parts of `.git` isn't enough (`.git` could be renamed and
-  replaced). `.sandbox` and the files in it must not be symlinks.
-- The sandbox only uses the approved copies of `.sandbox/allowlist.txt` and
-  `.sandbox/Dockerfile` in `instances/<id>/`, which change only after an
+  replaced). `.claude-sandbox` and the files in it must not be symlinks.
+- The sandbox only uses the approved copies of `.claude-sandbox/allowlist.txt` and
+  `.claude-sandbox/Dockerfile` in `instances/<id>/`, which change only after an
   interactive approval on the host. Allowlist entries need at least two
   labels (no `.` or `.com`). The toolchain builds from the approved
   Dockerfile alone, with no build context.
@@ -61,15 +61,15 @@ Every change must keep these true. `sandbox verify` checks most of them.
 ## Working on this repo
 
 - Test against real instances in throwaway git repos (not the user's
-  projects): `sandbox up`, `sandbox verify`, then `sandbox rm`. Prompts need a
-  terminal; in tests use `printf 'y\n' | script -qec "sandbox ..." /dev/null`.
+  projects): `claude-sandbox up`, `claude-sandbox verify`, then `claude-sandbox rm`. Prompts need a
+  terminal; in tests use `printf 'y\n' | script -qec "claude-sandbox ..." /dev/null`.
 - Changes to the sandbox layer should be tried on Debian, Alpine and Fedora
   bases (e.g. `debian:trixie-slim`, `python:3.13-alpine`, `fedora:42`).
-- After changing `proxy/`, `cli/` or `firewall/`, rebuild: `sandbox build`.
+- After changing `proxy/`, `cli/` or `firewall/`, rebuild: `claude-sandbox build`.
   Project images rebuild by themselves when the layer or CLI image changes.
 - For a new firewall check in `verify`, confirm it fails without the firewall
   too (e.g. same image with `--entrypoint` overridden); a check that passes
   either way proves nothing.
-- Shell scripts are kept shellcheck-clean (`sandbox` is bash; the others are
+- Shell scripts are kept shellcheck-clean (`claude-sandbox` is bash; the others are
   POSIX sh, since they run in Alpine and arbitrary toolchain images):
-  `docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.10.0 sandbox firewall/sandbox-init claude/install-layer cli/fetch`
+  `docker run --rm -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.10.0 claude-sandbox firewall/sandbox-init claude/install-layer cli/fetch`

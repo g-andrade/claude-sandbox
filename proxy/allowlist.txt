@@ -1,7 +1,7 @@
 # Domains every sandbox may reach (HTTPS/HTTP via the proxy). Package
-# registries go in each project's .sandbox/allowlist.txt instead.
+# registries go in each project's .claude-sandbox/allowlist.txt instead.
 # One per line. A leading dot (".example.com") also matches subdomains.
-# Apply changes with: sandbox reload (in each running sandbox)
+# Apply changes with: claude-sandbox reload (in each running sandbox)
 
 # Claude Code
 api.anthropic.com
