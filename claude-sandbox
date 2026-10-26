@@ -266,6 +266,7 @@ verify() {
 
   echo "claude container (via proxy):"
   check pass "api.anthropic.com reachable" claude 'curl -sS -o /dev/null -m 15 https://api.anthropic.com'
+  check pass "platform.claude.com reachable" claude 'curl -sS -o /dev/null -m 15 https://platform.claude.com'
   check fail "example.com blocked by allowlist" claude 'curl -sS -o /dev/null -m 15 https://example.com'
   check fail "allowlisted name on port 22 blocked" claude 'curl -sS -o /dev/null -m 15 https://github.com:22'
 

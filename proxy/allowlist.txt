@@ -5,6 +5,7 @@
 
 # Claude Code
 api.anthropic.com
+platform.claude.com
 
 # GitHub over HTTPS (clone, releases, raw files).
 # Note: lets the sandbox reach any GitHub repo; remove if you don't need it.
