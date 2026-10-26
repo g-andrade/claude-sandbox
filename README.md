@@ -1,8 +1,17 @@
 # claude-sandbox
 
+[![shellcheck](https://github.com/g-andrade/claude-sandbox/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/g-andrade/claude-sandbox/actions/workflows/shellcheck.yml)
+
 Per-project sandboxes for Claude Code: Docker containers whose only way out is
 a domain-allowlisting proxy, with nftables egress firewalls, and a toolchain
 image of each project's choosing.
+
+The firewalls run in small trusted containers, not in the one Claude runs in.
+Claude's container uses the project's image, treated as untrusted, and has no
+capabilities, so nothing in it can weaken the isolation. A project's allowlist
+and toolchain only change after you approve them on the host.
+
+An unofficial project, not affiliated with Anthropic.
 
 ```
            internal network (no route out)                egress network
@@ -31,12 +40,20 @@ claude ────────────────────────�
 
 Nothing is installed on the host.
 
+## Requirements
+
+Linux with Docker Engine and the Compose plugin (`docker compose`), plus bash
+and git. Tested with Docker 29 and Compose 5; macOS and Docker Desktop are
+untested.
+
 ## Setup (once)
 
-1. Auth: run `claude setup-token` on the host and set `CLAUDE_CODE_OAUTH_TOKEN`
+1. Clone: `git clone https://github.com/g-andrade/claude-sandbox ~/claude-sandbox`.
+   Any location works; the steps below assume this one.
+2. Auth: run `claude setup-token` on the host and set `CLAUDE_CODE_OAUTH_TOKEN`
    in `~/claude-sandbox/.env` (or set `ANTHROPIC_API_KEY`). The file is created
    from `.env.example` on first run; copy it yourself to set the token first.
-2. Optional, to run `claude-sandbox` from anywhere: `ln -s ~/claude-sandbox/claude-sandbox ~/.local/bin/claude-sandbox`
+3. Optional, to run `claude-sandbox` from anywhere: `ln -s ~/claude-sandbox/claude-sandbox ~/.local/bin/claude-sandbox`
 
 ## Usage
 

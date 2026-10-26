@@ -27,6 +27,7 @@ and manages one instance per project. See README.md for the user-facing view.
   approved copies `allowlist.approved.txt` and `Dockerfile.approved`, and
   `image.stamp` (what the project's image was last built from).
 - `.env`: shared secrets (gitignored). `.env.example` is its template.
+- `.github/workflows/shellcheck.yml`: CI, runs the shellcheck command below.
 
 ## Security invariants
 
