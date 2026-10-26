@@ -1,0 +1,65 @@
+#!/bin/sh
+# Entrypoint for every sandbox container: loads the container's egress
+# firewall into its own network namespace, then runs the command as an
+# unprivileged user with no capabilities, so nothing started afterwards can
+# change the rules.
+#
+# Usage: sandbox-init <role> <user> <command> [args...]
+#   role: claude | proxy | devport
+#
+# Outbound is default-deny. Loopback (including Docker's embedded DNS at
+# 127.0.0.11) and replies on established connections are always allowed.
+# The rules get their own table: Docker's DNS NAT rules live in this
+# namespace too, so never flush the ruleset.
+set -eu
+
+role=$1
+user=$2
+shift 2
+
+# Subnets of the Docker networks this container is attached to.
+local_nets=$(ip -4 route show scope link | awk '{print $1}' | paste -sd, -)
+
+case $role in
+  # Only the proxy port, on the sandbox's own networks.
+  claude) allow="ip daddr { $local_nets } tcp dport 3128 accept" ;;
+  # Only the dev server port, on the sandbox's own networks.
+  devport) allow="ip daddr { $local_nets } tcp dport 5173 accept" ;;
+  # Only web ports, on public addresses.
+  proxy) allow="ip daddr != @private_v4 tcp dport { 80, 443 } accept" ;;
+  *)
+    echo "sandbox-init: unknown role: $role" >&2
+    exit 1
+    ;;
+esac
+
+# Replaces the table atomically, so restarts don't stack up rules.
+nft -f - <<EOF
+table inet sandbox
+delete table inet sandbox
+
+table inet sandbox {
+	set private_v4 {
+		type ipv4_addr
+		flags interval
+		elements = {
+			0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8,
+			169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4
+		}
+	}
+
+	chain output {
+		type filter hook output priority filter; policy drop;
+		oif "lo" accept
+		ct state established,related accept
+		$allow
+	}
+}
+EOF
+
+# Docker's stdout/stderr pipes are root-only; let the command reopen them by
+# path (Squid logs to /dev/stdout). Write-only, so logs can't be read back.
+chmod o+w /proc/self/fd/1 /proc/self/fd/2 2>/dev/null || true
+
+exec setpriv --reuid="$user" --regid="$user" --init-groups \
+  --inh-caps=-all --bounding-set=-all --no-new-privs -- "$@"

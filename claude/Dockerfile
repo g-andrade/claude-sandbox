@@ -6,7 +6,7 @@ ARG CLAUDE_CODE_VERSION=latest
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl git jq less procps ripgrep unzip \
+      ca-certificates curl git iproute2 jq less nftables procps ripgrep unzip \
  && rm -rf /var/lib/apt/lists/*
 
 # Match the host user so files written to /workspace keep your ownership.
@@ -21,5 +21,10 @@ RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
 RUN mkdir -p /workspace /home/node/.claude \
  && chown node:node /workspace /home/node/.claude
 
-USER node
+COPY firewall/sandbox-init /usr/local/bin/sandbox-init
+
+# Starts as root only so sandbox-init can load the firewall; it then runs the
+# command as node with no capabilities. Exec in with --user node.
 WORKDIR /workspace
+ENTRYPOINT ["sandbox-init", "claude", "node"]
+CMD ["sleep", "infinity"]

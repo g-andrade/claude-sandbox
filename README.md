@@ -1,7 +1,7 @@
 # claude-sandbox
 
 Per-project sandboxes for Claude Code: Docker containers whose only way out is
-a domain-allowlisting proxy, backed by host nftables rules.
+a domain-allowlisting proxy, each with its own nftables egress firewall.
 
 ```
            internal network (no route out)                egress network
@@ -13,19 +13,25 @@ claude ────────────────────────�
 - **One sandbox per project** (git repository), created on first use, each with
   its own containers, networks, Claude config/history and dev port.
 - **claude** sits only on an internal Docker network, so it has no route out
-  and no external DNS. It runs as your UID with all capabilities dropped. The
-  only thing mounted is the project, at `/workspace`; `.git` and `.sandbox/`
-  are read-only inside.
+  and no external DNS. Claude runs as your UID with no capabilities. The only
+  thing mounted is the project, at `/workspace`; `.git` and `.sandbox/` are
+  read-only inside.
 - **proxy** allows HTTP/HTTPS (ports 80/443) only to allowlisted domains,
   never to private IPs, and never resolves names that aren't allowlisted.
-- **firewall/** is a host nftables backstop: one ruleset covers all sandboxes.
+- **Every container** loads its own egress firewall at startup: claude may
+  only reach the proxy, the proxy only public addresses on 80/443, and devport
+  only the dev server. It then drops to a non-root user with no capabilities,
+  so nothing running inside can change the rules. Containers report healthy
+  only once their rules are loaded.
+
+Nothing is installed on the host.
 
 ## Setup (once)
 
-1. Load the firewall (persists across reboots): `sudo ~/claude-sandbox/firewall/install.sh`
-2. Auth: run `claude setup-token` on the host and set `CLAUDE_CODE_OAUTH_TOKEN`
-   in `~/claude-sandbox/.env` (or set `ANTHROPIC_API_KEY`).
-3. Optional, to run `sandbox` from anywhere: `ln -s ~/claude-sandbox/sandbox ~/.local/bin/sandbox`
+1. Auth: run `claude setup-token` on the host and set `CLAUDE_CODE_OAUTH_TOKEN`
+   in `~/claude-sandbox/.env` (or set `ANTHROPIC_API_KEY`). The file is created
+   from `.env.example` on first run; copy it yourself to set the token first.
+2. Optional, to run `sandbox` from anywhere: `ln -s ~/claude-sandbox/sandbox ~/.local/bin/sandbox`
 
 ## Usage
 
@@ -91,3 +97,6 @@ sandbox.
   `setup-token` or an API key.
 - Approvals need a terminal. That stops anything inside the sandbox, not a
   process on the host that has a terminal of its own.
+- The firewalls share each container's network namespace. Getting around them
+  from inside would take a kernel exploit, which would defeat host-level rules
+  as well.

@@ -7,6 +7,13 @@ TEMPLATE=$(dirname "$(readlink -f "$0")")
 INSTANCES=$TEMPLATE/instances
 IMAGES=(claude-sandbox-claude claude-sandbox-proxy)
 
+# `compose exec` arguments for running a command in the claude container as
+# node with no capabilities. Plain `exec --user node` would leave the
+# container's bounding set (NET_ADMIN etc., needed only by sandbox-init) on
+# Claude's processes.
+AS_NODE=(-e HOME=/home/node claude
+  setpriv --reuid=node --regid=node --init-groups --inh-caps=-all --bounding-set=-all --)
+
 usage() {
   cat <<'EOF'
 Usage: sandbox <command>
@@ -42,7 +49,7 @@ confirm() {
   [[ $answer == [yY] ]]
 }
 
-# Sets PROJECT_DIR, NET_ID, ID and INSTANCE_DIR for the project containing $PWD.
+# Sets PROJECT_DIR, ID and INSTANCE_DIR for the project containing $PWD.
 resolve_project() {
   PROJECT_DIR=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)
   if [[ $PROJECT_DIR == / || $PROJECT_DIR == "$HOME" || $HOME == "$PROJECT_DIR"/* ||
@@ -51,8 +58,7 @@ resolve_project() {
   fi
   local name
   name=$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '-' | cut -c1-24)
-  NET_ID=$(printf '%s' "$PROJECT_DIR" | sha256sum | cut -c1-8)
-  ID=$name-$NET_ID
+  ID=$name-$(printf '%s' "$PROJECT_DIR" | sha256sum | cut -c1-8)
   INSTANCE_DIR=$INSTANCES/$ID
 }
 
@@ -78,9 +84,9 @@ compose() {
 }
 
 build_images() {
-  docker build "$@" -t claude-sandbox-proxy "$TEMPLATE/proxy"
-  docker build "$@" -t claude-sandbox-claude \
-    --build-arg HOST_UID="$(id -u)" --build-arg HOST_GID="$(id -g)" "$TEMPLATE/claude"
+  docker build "$@" -t claude-sandbox-proxy -f "$TEMPLATE/proxy/Dockerfile" "$TEMPLATE"
+  docker build "$@" -t claude-sandbox-claude -f "$TEMPLATE/claude/Dockerfile" \
+    --build-arg HOST_UID="$(id -u)" --build-arg HOST_GID="$(id -g)" "$TEMPLATE"
 }
 
 port_taken() {
@@ -95,7 +101,6 @@ create_instance() {
 # Sandbox for $PROJECT_DIR
 PROJECT_DIR=$PROJECT_DIR
 INSTANCE_DIR=$INSTANCE_DIR
-NET_ID=$NET_ID
 
 # Host port relayed to port 5173 inside the sandbox (run the dev server there
 # with --host). DEV_BIND=127.0.0.1 is this machine only; 0.0.0.0 also makes it
@@ -174,11 +179,14 @@ reload_proxy() {
   echo "Allowlists reloaded."
 }
 
-# Run a check inside a container. expect=pass|fail.
+# Run a check inside a container as an unprivileged user: in claude, the one
+# Claude runs as. expect=pass|fail.
 check() {
   local expect=$1 desc=$2 service=$3 result
   shift 3
-  if compose exec -T "$service" sh -c "$*" >/dev/null 2>&1; then result=pass; else result=fail; fi
+  local run=(exec -T --user nobody "$service")
+  [[ $service != claude ]] || run=(exec -T "${AS_NODE[@]}")
+  if compose "${run[@]}" sh -c "$*" >/dev/null 2>&1; then result=pass; else result=fail; fi
   if [[ $result == "$expect" ]]; then
     printf '  ok    %s\n' "$desc"
   else
@@ -208,13 +216,20 @@ verify() {
   check pass ".git is a mount point (can't be replaced)" claude \
     'grep -qE "^([^ ]+ ){4}/workspace/\.git ro[, ]" /proc/self/mountinfo'
 
-  echo "proxy container (nftables backstop):"
-  check pass "TCP 443 to 1.1.1.1 allowed" proxy 'socat -T5 /dev/null TCP:1.1.1.1:443,connect-timeout=5'
-  check fail "TCP 53 to 1.1.1.1 blocked" proxy 'socat -T5 /dev/null TCP:1.1.1.1:53,connect-timeout=5'
+  echo "firewalls (one per container):"
+  # Dropped packets time out (curl exit 28); without the firewall the closed
+  # port would refuse the connection instead.
+  check pass "claude: drops traffic other than to the proxy" claude \
+    'curl -sS -o /dev/null -m 3 --noproxy "*" http://proxy:80; [ $? -eq 28 ]'
+  check pass "claude: Claude runs without capabilities" claude \
+    'grep -qE "^CapEff:\s+0+$" /proc/self/status && grep -qE "^CapBnd:\s+0+$" /proc/self/status'
+  check fail "claude: rules can't be changed from inside" claude 'nft add table inet probe'
+  check pass "proxy: TCP 443 to public IPs allowed" proxy 'socat -T5 /dev/null TCP:1.1.1.1:443,connect-timeout=5'
+  check fail "proxy: other ports blocked (TCP 53)" proxy 'socat -T5 /dev/null TCP:1.1.1.1:53,connect-timeout=5'
+  check fail "devport: internet blocked" devport 'socat -T5 /dev/null TCP:1.1.1.1:443,connect-timeout=5'
 
   if ((failures)); then
     echo "$failures check(s) failed."
-    echo "If only the nftables check failed, load the firewall: sudo $TEMPLATE/firewall/install.sh"
     exit 1
   fi
   echo "All checks passed."
@@ -261,11 +276,11 @@ case "${1:-}" in
   claude)
     shift
     start
-    compose exec claude claude --dangerously-skip-permissions "$@"
+    compose exec "${AS_NODE[@]}" claude --dangerously-skip-permissions "$@"
     ;;
   shell)
     start
-    compose exec claude bash
+    compose exec "${AS_NODE[@]}" bash
     ;;
   up) start ;;
   down) require_instance && compose down ;;

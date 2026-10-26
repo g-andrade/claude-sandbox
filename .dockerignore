@@ -1,0 +1,5 @@
+# Images build with the repo root as context; send only what they COPY
+# (keeps .env and instances/ out of the build).
+*
+!firewall/sandbox-init
+!proxy/squid.conf
