@@ -1,0 +1,17 @@
+# Domains the sandbox may reach (HTTPS/HTTP via the proxy).
+# One per line. A leading dot (".example.com") also matches subdomains.
+# Apply changes with: ./sandbox reload
+
+# Claude Code
+api.anthropic.com
+
+# npm
+registry.npmjs.org
+
+# GitHub over HTTPS (clone, releases, raw files).
+# Note: lets the sandbox reach any GitHub repo; remove if you don't need it.
+github.com
+api.github.com
+codeload.github.com
+objects.githubusercontent.com
+raw.githubusercontent.com

@@ -1,0 +1,111 @@
+# One sandbox instance. `sandbox` sets the compose project name per project
+# and supplies PROJECT_DIR, INSTANCE_DIR, NET_ID, DEV_PORT and DEV_BIND from
+# instances/<id>/instance.env.
+#
+#   claude  -> only on the internal network (no route out); reaches the
+#              internet solely through the proxy's domain allowlist.
+#   proxy   -> Squid; bridges the internal and egress networks, allows
+#              CONNECT only to allowlisted domains.
+#   devport -> relays a published host port to the dev server inside claude.
+#
+# Host-side nftables rules (firewall/) match the csi-*/cse-* bridge names.
+
+services:
+  claude:
+    image: claude-sandbox-claude
+    pull_policy: never
+    hostname: sandbox
+    init: true
+    command: ["sleep", "infinity"]
+    depends_on: [proxy]
+    networks: [internal]
+    working_dir: /workspace
+    environment:
+      HTTPS_PROXY: http://proxy:3128
+      HTTP_PROXY: http://proxy:3128
+      https_proxy: http://proxy:3128
+      http_proxy: http://proxy:3128
+      NO_PROXY: localhost,127.0.0.1
+      no_proxy: localhost,127.0.0.1
+      CLAUDE_CONFIG_DIR: /home/node/.claude
+      DISABLE_AUTOUPDATER: "1"
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      # Passed through from .env only when set there.
+      CLAUDE_CODE_OAUTH_TOKEN:
+      ANTHROPIC_API_KEY:
+    volumes:
+      - type: bind
+        source: ${PROJECT_DIR:?}
+        target: /workspace
+      # Read-only overlays. .sandbox holds the project's allowlist. All of
+      # .git, because git on the host executes what's in it (config can set
+      # core.fsmonitor, hooks run on commit); overlaying only config/hooks
+      # isn't enough, since .git itself could then be renamed and replaced.
+      # Being mount points, neither can be renamed or deleted from inside.
+      - type: bind
+        source: ${PROJECT_DIR}/.sandbox
+        target: /workspace/.sandbox
+        read_only: true
+      - type: bind
+        source: ${PROJECT_DIR}/.git
+        target: /workspace/.git
+        read_only: true
+      - claude-config:/home/node/.claude
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 8g
+    cpus: 4
+    pids_limit: 2048
+
+  proxy:
+    image: claude-sandbox-proxy
+    pull_policy: never
+    restart: unless-stopped
+    volumes:
+      # Shared allowlist, plus this instance's approved copy of the project's.
+      - type: bind
+        source: ./proxy
+        target: /etc/squid/template
+        read_only: true
+      - type: bind
+        source: ${INSTANCE_DIR:?}
+        target: /etc/squid/instance
+        read_only: true
+    networks: [internal, egress]
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 256
+
+  devport:
+    image: claude-sandbox-proxy
+    pull_policy: never
+    restart: unless-stopped
+    command: ["socat", "TCP-LISTEN:5173,fork,reuseaddr", "TCP:claude:5173"]
+    ports:
+      - "${DEV_BIND:-127.0.0.1}:${DEV_PORT:?}:5173"
+    networks: [internal, egress]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 64m
+    pids_limit: 128
+
+networks:
+  internal:
+    internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: csi-${NET_ID:?}
+  egress:
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: cse-${NET_ID:?}
+
+volumes:
+  claude-config:

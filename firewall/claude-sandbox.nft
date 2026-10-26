@@ -1,0 +1,47 @@
+#!/usr/sbin/nft -f
+# Host-side backstop for all claude-sandbox instances.
+#
+# Matches the bridge name prefixes from compose.yaml (csi-* internal,
+# cse-* egress), so one ruleset covers every instance, loads before the
+# networks exist and survives Docker restarts. It only ever drops: anything it
+# lets through still has to pass Docker's own chains. Safe to re-run.
+
+table inet claude_sandbox
+delete table inet claude_sandbox
+
+table inet claude_sandbox {
+	set private_v4 {
+		type ipv4_addr
+		flags interval
+		elements = {
+			0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8,
+			169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4
+		}
+	}
+
+	chain forward {
+		type filter hook forward priority filter - 10; policy accept;
+
+		# csi-* (claude): traffic never leaves the internal bridges.
+		# Traffic between two instances' bridges is blocked by Docker's
+		# network isolation and by internal networks having no gateway.
+		iifname "csi-*" oifname != "csi-*" counter drop
+		oifname "csi-*" iifname != "csi-*" counter drop
+
+		# cse-* (proxy, devport): new outbound connections only to public
+		# IPv4 on TCP 80/443. Inbound to published dev ports and reply
+		# traffic are unaffected.
+		iifname "cse-*" oifname != "cse-*" meta nfproto ipv6 counter drop
+		iifname "cse-*" oifname != "cse-*" ct state new ip daddr @private_v4 counter drop
+		iifname "cse-*" oifname != "cse-*" ct state new tcp dport { 80, 443 } return
+		iifname "cse-*" oifname != "cse-*" ct state new counter drop
+	}
+
+	chain input {
+		type filter hook input priority filter - 10; policy accept;
+
+		# Containers can't open connections to the host itself.
+		iifname "csi-*" ct state new counter drop
+		iifname "cse-*" ct state new counter drop
+	}
+}

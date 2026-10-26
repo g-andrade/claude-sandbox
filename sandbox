@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# Per-project Claude Code sandboxes built from this template. Run without
+# arguments for usage.
+set -euo pipefail
+
+TEMPLATE=$(dirname "$(readlink -f "$0")")
+INSTANCES=$TEMPLATE/instances
+IMAGES=(claude-sandbox-claude claude-sandbox-proxy)
+
+usage() {
+  cat <<'EOF'
+Usage: sandbox <command>
+
+Run inside a project (a git repository). Each project gets its own sandbox.
+
+  claude [args]  Start this project's sandbox and run Claude Code in /workspace
+                 (with --dangerously-skip-permissions; extra args pass through)
+  shell          Open a bash shell in this project's sandbox
+  up             Start this project's sandbox
+  down           Stop it (Claude config and history are kept)
+  reload         Apply allowlist changes (asks you to approve project changes)
+  verify         Check that allowed traffic works and everything else is blocked
+  logs           Follow the proxy log (every allowed and denied request)
+  info           Show this project's sandbox settings
+  list           List all sandboxes
+  rm [id]        Delete this project's sandbox, or the one with the given id,
+                 including its Claude config and history
+  build          Build the shared images (done automatically on first use)
+  rebuild        Rebuild the images from fresh bases (updates Claude Code)
+EOF
+}
+
+die() {
+  echo "sandbox: $*" >&2
+  exit 1
+}
+
+confirm() {
+  [[ -t 0 ]] || die "confirmation needed; run this from an interactive terminal"
+  local answer
+  read -rp "$1 [y/N] " answer
+  [[ $answer == [yY] ]]
+}
+
+# Sets PROJECT_DIR, NET_ID, ID and INSTANCE_DIR for the project containing $PWD.
+resolve_project() {
+  PROJECT_DIR=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)
+  if [[ $PROJECT_DIR == / || $PROJECT_DIR == "$HOME" || $HOME == "$PROJECT_DIR"/* ||
+    $PROJECT_DIR == "$TEMPLATE" || $PROJECT_DIR == "$TEMPLATE"/* || $TEMPLATE == "$PROJECT_DIR"/* ]]; then
+    die "refusing to sandbox $PROJECT_DIR; run this inside a project directory"
+  fi
+  local name
+  name=$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '-' | cut -c1-24)
+  NET_ID=$(printf '%s' "$PROJECT_DIR" | sha256sum | cut -c1-8)
+  ID=$name-$NET_ID
+  INSTANCE_DIR=$INSTANCES/$ID
+}
+
+require_instance() {
+  resolve_project
+  [[ -f $INSTANCE_DIR/instance.env ]] || die "no sandbox for $PROJECT_DIR yet; start one with: sandbox up"
+}
+
+# For instances whose project directory is gone.
+select_instance() {
+  ID=$1
+  INSTANCE_DIR=$INSTANCES/$ID
+  [[ $ID =~ ^[a-z0-9-]+$ && -f $INSTANCE_DIR/instance.env ]] || die "no sandbox with id $ID (see: sandbox list)"
+}
+
+instance_var() {
+  sed -n "s/^$1=//p" "$INSTANCE_DIR/instance.env"
+}
+
+compose() {
+  docker compose --project-name "cs-$ID" --file "$TEMPLATE/compose.yaml" \
+    --env-file "$TEMPLATE/.env" --env-file "$INSTANCE_DIR/instance.env" "$@"
+}
+
+build_images() {
+  docker build "$@" -t claude-sandbox-proxy "$TEMPLATE/proxy"
+  docker build "$@" -t claude-sandbox-claude \
+    --build-arg HOST_UID="$(id -u)" --build-arg HOST_GID="$(id -g)" "$TEMPLATE/claude"
+}
+
+port_taken() {
+  grep -qsx "DEV_PORT=$1" "$INSTANCES"/*/instance.env || [[ -n $(ss -Hltn "sport = :$1") ]]
+}
+
+create_instance() {
+  local port=5173
+  while port_taken "$port"; do port=$((port + 1)); done
+  mkdir -p "$INSTANCE_DIR"
+  cat >"$INSTANCE_DIR/instance.env" <<EOF
+# Sandbox for $PROJECT_DIR
+PROJECT_DIR=$PROJECT_DIR
+INSTANCE_DIR=$INSTANCE_DIR
+NET_ID=$NET_ID
+
+# Host port relayed to port 5173 inside the sandbox (run the dev server there
+# with --host). DEV_BIND=127.0.0.1 is this machine only; 0.0.0.0 also makes it
+# reachable from your LAN, e.g. a phone. Apply changes with: sandbox up
+DEV_PORT=$port
+DEV_BIND=127.0.0.1
+EOF
+  : >"$INSTANCE_DIR/allowlist.approved.txt"
+  echo "Created sandbox $ID for $PROJECT_DIR (dev port $port)."
+}
+
+# Creates what the read-only overlays in compose.yaml need on the host.
+prepare_project() {
+  if [[ -f $PROJECT_DIR/.git ]]; then
+    die "git worktrees and submodule checkouts aren't supported: their git directory is outside the project"
+  fi
+  if [[ ! -d $PROJECT_DIR/.git ]]; then
+    echo "$PROJECT_DIR isn't a git repository. The sandbox needs one, created on the"
+    echo "host: inside the sandbox .git is read-only, since host git executes its contents."
+    confirm "Run git init there now?" || die "aborted"
+    git -C "$PROJECT_DIR" init -q
+  fi
+  # A symlink here would let a cloned repo mount any host path into the sandbox.
+  [[ ! -L $PROJECT_DIR/.sandbox ]] || die "$PROJECT_DIR/.sandbox is a symlink; it must be a directory"
+  mkdir -p "$PROJECT_DIR/.sandbox"
+  [[ -e $PROJECT_DIR/.sandbox/allowlist.txt ]] || cat >"$PROJECT_DIR/.sandbox/allowlist.txt" <<EOF
+# Extra domains this project's sandbox may reach, on top of the shared list in
+# $TEMPLATE/proxy/allowlist.txt.
+# One per line; a leading dot also matches subdomains (.example.com).
+# Read-only inside the sandbox. Changes need your approval: sandbox reload
+EOF
+}
+
+# Domains from an allowlist file: comments and blank lines dropped, sorted.
+domains() {
+  sed 's/#.*//' "$1" 2>/dev/null | tr -s '[:space:]' '\n' | tr '[:upper:]' '[:lower:]' | grep -v '^$' | sort -u || true
+}
+
+# The proxy only reads the approved copy in the instance directory. Copies the
+# project's allowlist there, after asking, when they differ. Returns 1 when
+# nothing changed.
+approve_allowlist() {
+  local file=$PROJECT_DIR/.sandbox/allowlist.txt approved=$INSTANCE_DIR/allowlist.approved.txt
+  local current previous invalid
+  current=$(domains "$file")
+  previous=$(cat "$approved")
+  [[ $current != "$previous" ]] || return 1
+
+  # Each entry needs at least two labels, so "." or ".com" can't open up everything.
+  invalid=$(grep -Eiv '^\.?([a-z0-9-]+\.)+[a-z0-9-]+$' <<<"$current" | grep -v '^$' || true)
+  [[ -z $invalid ]] || die "invalid entries in $file:"$'\n'"$invalid"
+
+  echo "$file differs from the approved version:"
+  diff <(grep -v '^$' <<<"$previous") <(grep -v '^$' <<<"$current") | sed -n 's/^> /  + /p; s/^< /  - /p' || true
+  confirm "Apply?" || die "not applied; the sandbox keeps the last approved allowlist"
+  printf '%s\n' "$current" >"$approved"
+}
+
+start() {
+  resolve_project
+  prepare_project
+  [[ -f $INSTANCE_DIR/instance.env ]] || create_instance
+  local changed=false
+  approve_allowlist && changed=true
+  docker image inspect "${IMAGES[@]}" >/dev/null 2>&1 || build_images
+  compose --progress quiet up -d --wait
+  if $changed; then reload_proxy; fi
+}
+
+reload_proxy() {
+  if [[ -z $(compose ps -q --status running proxy) ]]; then
+    echo "Sandbox isn't running; allowlists apply on its next start."
+    return
+  fi
+  compose --progress quiet kill -s HUP proxy # Squid re-reads its config on SIGHUP
+  echo "Allowlists reloaded."
+}
+
+# Run a check inside a container. expect=pass|fail.
+check() {
+  local expect=$1 desc=$2 service=$3 result
+  shift 3
+  if compose exec -T "$service" sh -c "$*" >/dev/null 2>&1; then result=pass; else result=fail; fi
+  if [[ $result == "$expect" ]]; then
+    printf '  ok    %s\n' "$desc"
+  else
+    printf '  FAIL  %s\n' "$desc"
+    failures=$((failures + 1))
+  fi
+}
+
+verify() {
+  start
+  failures=0
+
+  echo "claude container (via proxy):"
+  check pass "api.anthropic.com reachable" claude 'curl -sS -o /dev/null -m 15 https://api.anthropic.com'
+  check pass "registry.npmjs.org reachable" claude 'curl -sS -o /dev/null -m 15 https://registry.npmjs.org/'
+  check fail "example.com blocked by allowlist" claude 'curl -sS -o /dev/null -m 15 https://example.com'
+  check fail "allowlisted name on port 22 blocked" claude 'curl -sS -o /dev/null -m 15 https://github.com:22'
+
+  echo "claude container (bypassing proxy):"
+  check fail "direct HTTPS to 1.1.1.1 blocked" claude 'curl -sS -o /dev/null -m 5 --noproxy "*" https://1.1.1.1'
+  check fail "external DNS resolution blocked" claude 'getent hosts example.com'
+  check pass "proxy resolvable by name" claude 'getent hosts proxy'
+
+  echo "claude container (read-only paths):"
+  check fail ".sandbox not writable" claude 'touch /workspace/.sandbox/x && rm /workspace/.sandbox/x'
+  check fail ".git not writable" claude 'touch /workspace/.git/x && rm /workspace/.git/x'
+  check pass ".git is a mount point (can't be replaced)" claude \
+    'grep -qE "^([^ ]+ ){4}/workspace/\.git ro[, ]" /proc/self/mountinfo'
+
+  echo "proxy container (nftables backstop):"
+  check pass "TCP 443 to 1.1.1.1 allowed" proxy 'socat -T5 /dev/null TCP:1.1.1.1:443,connect-timeout=5'
+  check fail "TCP 53 to 1.1.1.1 blocked" proxy 'socat -T5 /dev/null TCP:1.1.1.1:53,connect-timeout=5'
+
+  if ((failures)); then
+    echo "$failures check(s) failed."
+    echo "If only the nftables check failed, load the firewall: sudo $TEMPLATE/firewall/install.sh"
+    exit 1
+  fi
+  echo "All checks passed."
+}
+
+info() {
+  require_instance
+  cat <<EOF
+Project:    $PROJECT_DIR
+Sandbox:    $ID
+Settings:   $INSTANCE_DIR/instance.env
+Dev server: http://$(instance_var DEV_BIND):$(instance_var DEV_PORT) -> port 5173 inside
+Allowlists: $TEMPLATE/proxy/allowlist.txt
+            $PROJECT_DIR/.sandbox/allowlist.txt
+EOF
+}
+
+list() {
+  local env id project port state
+  printf '%-34s %-8s %-6s %s\n' ID STATE PORT PROJECT
+  for env in "$INSTANCES"/*/instance.env; do
+    [[ -f $env ]] || continue
+    id=$(basename "$(dirname "$env")")
+    project=$(sed -n 's/^PROJECT_DIR=//p' "$env")
+    port=$(sed -n 's/^DEV_PORT=//p' "$env")
+    state=stopped
+    [[ -z $(docker ps -q --filter "label=com.docker.compose.project=cs-$id") ]] || state=running
+    [[ -d $project ]] || project="$project (missing)"
+    printf '%-34s %-8s %-6s %s\n' "$id" "$state" "$port" "$project"
+  done
+}
+
+remove() {
+  if [[ $# -gt 0 ]]; then select_instance "$1"; else require_instance; fi
+  confirm "Delete sandbox $ID, including its Claude config and history?" || exit 1
+  compose --progress quiet down --volumes --remove-orphans
+  rm -rf -- "$INSTANCE_DIR"
+  echo "Deleted $ID. The project's .sandbox/ directory was left in place."
+}
+
+[[ -f $TEMPLATE/.env ]] || install -m 600 "$TEMPLATE/.env.example" "$TEMPLATE/.env"
+
+case "${1:-}" in
+  claude)
+    shift
+    start
+    compose exec claude claude --dangerously-skip-permissions "$@"
+    ;;
+  shell)
+    start
+    compose exec claude bash
+    ;;
+  up) start ;;
+  down) require_instance && compose down ;;
+  reload)
+    require_instance
+    approve_allowlist || true
+    reload_proxy
+    ;;
+  verify) verify ;;
+  logs) require_instance && compose logs -f proxy ;;
+  info) info ;;
+  list) list ;;
+  rm) shift && remove "$@" ;;
+  build) build_images ;;
+  rebuild)
+    build_images --pull --no-cache
+    echo "Running sandboxes switch to the new images on their next start."
+    ;;
+  *) usage ;;
+esac
