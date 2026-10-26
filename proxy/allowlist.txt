@@ -1,12 +1,10 @@
-# Domains the sandbox may reach (HTTPS/HTTP via the proxy).
+# Domains every sandbox may reach (HTTPS/HTTP via the proxy). Package
+# registries go in each project's .sandbox/allowlist.txt instead.
 # One per line. A leading dot (".example.com") also matches subdomains.
-# Apply changes with: ./sandbox reload
+# Apply changes with: sandbox reload (in each running sandbox)
 
 # Claude Code
 api.anthropic.com
-
-# npm
-registry.npmjs.org
 
 # GitHub over HTTPS (clone, releases, raw files).
 # Note: lets the sandbox reach any GitHub repo; remove if you don't need it.

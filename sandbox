@@ -5,14 +5,7 @@ set -euo pipefail
 
 TEMPLATE=$(dirname "$(readlink -f "$0")")
 INSTANCES=$TEMPLATE/instances
-IMAGES=(claude-sandbox-claude claude-sandbox-proxy)
-
-# `compose exec` arguments for running a command in the claude container as
-# node with no capabilities. Plain `exec --user node` would leave the
-# container's bounding set (NET_ADMIN etc., needed only by sandbox-init) on
-# Claude's processes.
-AS_NODE=(-e HOME=/home/node claude
-  setpriv --reuid=node --regid=node --init-groups --inh-caps=-all --bounding-set=-all --)
+SHARED_IMAGES=(claude-sandbox-proxy claude-sandbox-cli)
 
 usage() {
   cat <<'EOF'
@@ -23,17 +16,17 @@ Run inside a project (a git repository). Each project gets its own sandbox.
   claude [args]  Start this project's sandbox and run Claude Code in /workspace
                  (with --dangerously-skip-permissions; extra args pass through)
   shell          Open a bash shell in this project's sandbox
-  up             Start this project's sandbox
-  down           Stop it (Claude config and history are kept)
+  up             Start this project's sandbox, rebuilding its image if needed
+  down           Stop it (its home directory, with Claude's config, is kept)
   reload         Apply allowlist changes (asks you to approve project changes)
   verify         Check that allowed traffic works and everything else is blocked
   logs           Follow the proxy log (every allowed and denied request)
   info           Show this project's sandbox settings
   list           List all sandboxes
   rm [id]        Delete this project's sandbox, or the one with the given id,
-                 including its Claude config and history
+                 including its home directory
   build          Build the shared images (done automatically on first use)
-  rebuild        Rebuild the images from fresh bases (updates Claude Code)
+  rebuild        Rebuild all images from fresh bases (updates Claude Code)
 EOF
 }
 
@@ -47,6 +40,37 @@ confirm() {
   local answer
   read -rp "$1 [y/N] " answer
   [[ $answer == [yY] ]]
+}
+
+# Written to new projects' .sandbox/, and as the initial approved versions, so
+# only changes a project makes need approval.
+default_allowlist() {
+  cat <<EOF
+# Extra domains this project's sandbox may reach, on top of the shared list in
+# $TEMPLATE/proxy/allowlist.txt.
+# One per line; a leading dot also matches subdomains (.example.com).
+# Read-only inside the sandbox. Changes need your approval: sandbox reload
+#
+# Package registries, for example:
+#   JavaScript: registry.npmjs.org
+#   Python:     pypi.org files.pythonhosted.org
+#   Elixir:     hex.pm repo.hex.pm builds.hex.pm
+EOF
+}
+
+default_dockerfile() {
+  cat <<'EOF'
+# Toolchain for this project's sandbox. Any image with a shell and apt, apk or
+# dnf works; sandbox adds Claude Code and the tools it needs on top. No COPY
+# from the project: this builds without a context. Read-only inside the
+# sandbox; changes need your approval and apply on the next `sandbox up`.
+#
+# For example:
+#   FROM hexpm/elixir:1.20.4-erlang-28.5.0.8-debian-bookworm-20261005-slim
+#   FROM python:3.13-slim
+#   FROM node:24-trixie-slim
+FROM debian:trixie-slim
+EOF
 }
 
 # Sets PROJECT_DIR, ID and INSTANCE_DIR for the project containing $PWD.
@@ -79,14 +103,41 @@ instance_var() {
 }
 
 compose() {
-  docker compose --project-name "cs-$ID" --file "$TEMPLATE/compose.yaml" \
-    --env-file "$TEMPLATE/.env" --env-file "$INSTANCE_DIR/instance.env" "$@"
+  HOST_UID=$(id -u) HOST_GID=$(id -g) docker compose --project-name "cs-$ID" \
+    --file "$TEMPLATE/compose.yaml" --env-file "$TEMPLATE/.env" --env-file "$INSTANCE_DIR/instance.env" "$@"
 }
 
-build_images() {
+build_shared_images() {
   docker build "$@" -t claude-sandbox-proxy -f "$TEMPLATE/proxy/Dockerfile" "$TEMPLATE"
-  docker build "$@" -t claude-sandbox-claude -f "$TEMPLATE/claude/Dockerfile" \
+  docker build "$@" -t claude-sandbox-cli -f "$TEMPLATE/cli/Dockerfile" "$TEMPLATE"
+}
+
+# This project's claude image: its approved toolchain Dockerfile, with the
+# sandbox layer (claude/Dockerfile) on top, built for the toolchain's libc.
+build_claude_image() {
+  local toolchain=claude-sandbox-toolchain:$ID libc ripgrep=1
+  echo "Building the sandbox image for $ID..."
+  docker build --pull -t "$toolchain" - <"$INSTANCE_DIR/Dockerfile.approved"
+  libc=$(docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+    --entrypoint sh "$toolchain" -c 'if ls /lib/ld-musl-* >/dev/null 2>&1; then echo musl; else echo glibc; fi') ||
+    die "the toolchain image needs a shell (sh)"
+  [[ $libc == glibc ]] || ripgrep=0
+  docker build -t "claude-sandbox-claude:$ID" -f "$TEMPLATE/claude/Dockerfile" \
+    --build-arg BASE="$toolchain" --build-arg LIBC="$libc" --build-arg BUILTIN_RIPGREP="$ripgrep" \
     --build-arg HOST_UID="$(id -u)" --build-arg HOST_GID="$(id -g)" "$TEMPLATE"
+}
+
+# Rebuilds this project's claude image when an input changed: the approved
+# toolchain, the sandbox layer, or the Claude CLI image.
+ensure_images() {
+  docker image inspect "${SHARED_IMAGES[@]}" >/dev/null 2>&1 || build_shared_images
+  local stamp=$INSTANCE_DIR/image.stamp inputs
+  inputs=$(cat "$INSTANCE_DIR/Dockerfile.approved" "$TEMPLATE/claude/Dockerfile" "$TEMPLATE/claude/install-layer" | sha256sum)
+  inputs+=$(docker image inspect -f '{{.Id}}' claude-sandbox-cli)
+  if [[ $(cat "$stamp" 2>/dev/null) != "$inputs" ]] || ! docker image inspect "claude-sandbox-claude:$ID" >/dev/null 2>&1; then
+    build_claude_image
+    printf '%s' "$inputs" >"$stamp"
+  fi
 }
 
 port_taken() {
@@ -101,6 +152,7 @@ create_instance() {
 # Sandbox for $PROJECT_DIR
 PROJECT_DIR=$PROJECT_DIR
 INSTANCE_DIR=$INSTANCE_DIR
+INSTANCE_ID=$ID
 
 # Host port relayed to port 5173 inside the sandbox (run the dev server there
 # with --host). DEV_BIND=127.0.0.1 is this machine only; 0.0.0.0 also makes it
@@ -108,7 +160,8 @@ INSTANCE_DIR=$INSTANCE_DIR
 DEV_PORT=$port
 DEV_BIND=127.0.0.1
 EOF
-  : >"$INSTANCE_DIR/allowlist.approved.txt"
+  domains <(default_allowlist) >"$INSTANCE_DIR/allowlist.approved.txt"
+  default_dockerfile >"$INSTANCE_DIR/Dockerfile.approved"
   echo "Created sandbox $ID for $PROJECT_DIR (dev port $port)."
 }
 
@@ -123,15 +176,14 @@ prepare_project() {
     confirm "Run git init there now?" || die "aborted"
     git -C "$PROJECT_DIR" init -q
   fi
-  # A symlink here would let a cloned repo mount any host path into the sandbox.
-  [[ ! -L $PROJECT_DIR/.sandbox ]] || die "$PROJECT_DIR/.sandbox is a symlink; it must be a directory"
+  # A symlink here would let a cloned repo mount or show any host path.
+  local path
+  for path in .sandbox .sandbox/allowlist.txt .sandbox/Dockerfile; do
+    [[ ! -L $PROJECT_DIR/$path ]] || die "$PROJECT_DIR/$path is a symlink; it must be a regular file or directory"
+  done
   mkdir -p "$PROJECT_DIR/.sandbox"
-  [[ -e $PROJECT_DIR/.sandbox/allowlist.txt ]] || cat >"$PROJECT_DIR/.sandbox/allowlist.txt" <<EOF
-# Extra domains this project's sandbox may reach, on top of the shared list in
-# $TEMPLATE/proxy/allowlist.txt.
-# One per line; a leading dot also matches subdomains (.example.com).
-# Read-only inside the sandbox. Changes need your approval: sandbox reload
-EOF
+  [[ -e $PROJECT_DIR/.sandbox/allowlist.txt ]] || default_allowlist >"$PROJECT_DIR/.sandbox/allowlist.txt"
+  [[ -e $PROJECT_DIR/.sandbox/Dockerfile ]] || default_dockerfile >"$PROJECT_DIR/.sandbox/Dockerfile"
 }
 
 # Domains from an allowlist file: comments and blank lines dropped, sorted.
@@ -139,35 +191,48 @@ domains() {
   sed 's/#.*//' "$1" 2>/dev/null | tr -s '[:space:]' '\n' | tr '[:upper:]' '[:lower:]' | grep -v '^$' | sort -u || true
 }
 
-# The proxy only reads the approved copy in the instance directory. Copies the
-# project's allowlist there, after asking, when they differ. Returns 1 when
-# nothing changed.
-approve_allowlist() {
-  local file=$PROJECT_DIR/.sandbox/allowlist.txt approved=$INSTANCE_DIR/allowlist.approved.txt
-  local current previous invalid
-  current=$(domains "$file")
+# Prints $1 as lines; nothing at all when it's empty.
+lines() {
+  [[ -z $1 ]] || printf '%s\n' "$1"
+}
+
+# The sandbox only uses approved copies, in the instance directory, of the
+# project's .sandbox files. Asks before replacing one with the project's
+# current content. Returns 1 when nothing changed.
+approve() {
+  local file=$1 current=$2 approved=$3 previous
   previous=$(cat "$approved")
   [[ $current != "$previous" ]] || return 1
+  echo "$file differs from the approved version:"
+  diff -u <(lines "$previous") <(lines "$current") | sed '1,2d; /^@@/d; s/^/  /' || true
+  confirm "Apply?" || die "not applied; the sandbox keeps the last approved version"
+  printf '%s\n' "$current" >"$approved"
+}
 
+approve_allowlist() {
+  local file=$PROJECT_DIR/.sandbox/allowlist.txt current invalid
+  current=$(domains "$file")
   # Each entry needs at least two labels, so "." or ".com" can't open up everything.
   invalid=$(grep -Eiv '^\.?([a-z0-9-]+\.)+[a-z0-9-]+$' <<<"$current" | grep -v '^$' || true)
   [[ -z $invalid ]] || die "invalid entries in $file:"$'\n'"$invalid"
+  approve "$file" "$current" "$INSTANCE_DIR/allowlist.approved.txt"
+}
 
-  echo "$file differs from the approved version:"
-  diff <(grep -v '^$' <<<"$previous") <(grep -v '^$' <<<"$current") | sed -n 's/^> /  + /p; s/^< /  - /p' || true
-  confirm "Apply?" || die "not applied; the sandbox keeps the last approved allowlist"
-  printf '%s\n' "$current" >"$approved"
+approve_dockerfile() {
+  local file=$PROJECT_DIR/.sandbox/Dockerfile
+  approve "$file" "$(cat "$file")" "$INSTANCE_DIR/Dockerfile.approved"
 }
 
 start() {
   resolve_project
   prepare_project
   [[ -f $INSTANCE_DIR/instance.env ]] || create_instance
-  local changed=false
-  approve_allowlist && changed=true
-  docker image inspect "${IMAGES[@]}" >/dev/null 2>&1 || build_images
+  local allowlist_changed=false
+  approve_allowlist && allowlist_changed=true
+  approve_dockerfile || true
+  ensure_images
   compose --progress quiet up -d --wait
-  if $changed; then reload_proxy; fi
+  if $allowlist_changed; then reload_proxy; fi
 }
 
 reload_proxy() {
@@ -184,9 +249,9 @@ reload_proxy() {
 check() {
   local expect=$1 desc=$2 service=$3 result
   shift 3
-  local run=(exec -T --user nobody "$service")
-  [[ $service != claude ]] || run=(exec -T "${AS_NODE[@]}")
-  if compose "${run[@]}" sh -c "$*" >/dev/null 2>&1; then result=pass; else result=fail; fi
+  local user=(--user nobody)
+  [[ $service != claude ]] || user=()
+  if compose exec -T "${user[@]}" "$service" sh -c "$*" >/dev/null 2>&1; then result=pass; else result=fail; fi
   if [[ $result == "$expect" ]]; then
     printf '  ok    %s\n' "$desc"
   else
@@ -201,7 +266,6 @@ verify() {
 
   echo "claude container (via proxy):"
   check pass "api.anthropic.com reachable" claude 'curl -sS -o /dev/null -m 15 https://api.anthropic.com'
-  check pass "registry.npmjs.org reachable" claude 'curl -sS -o /dev/null -m 15 https://registry.npmjs.org/'
   check fail "example.com blocked by allowlist" claude 'curl -sS -o /dev/null -m 15 https://example.com'
   check fail "allowlisted name on port 22 blocked" claude 'curl -sS -o /dev/null -m 15 https://github.com:22'
 
@@ -210,20 +274,21 @@ verify() {
   check fail "external DNS resolution blocked" claude 'getent hosts example.com'
   check pass "proxy resolvable by name" claude 'getent hosts proxy'
 
-  echo "claude container (read-only paths):"
+  echo "claude container (privileges and read-only paths):"
+  # shellcheck disable=SC2016 # expands inside the container
+  check pass "Claude runs as your user, not root" claude '[ "$(id -u)" != 0 ]'
+  check pass "Claude has no capabilities" claude \
+    'grep -qE "^CapEff:[[:space:]]+0+$" /proc/self/status && grep -qE "^CapBnd:[[:space:]]+0+$" /proc/self/status'
   check fail ".sandbox not writable" claude 'touch /workspace/.sandbox/x && rm /workspace/.sandbox/x'
   check fail ".git not writable" claude 'touch /workspace/.git/x && rm /workspace/.git/x'
   check pass ".git is a mount point (can't be replaced)" claude \
     'grep -qE "^([^ ]+ ){4}/workspace/\.git ro[, ]" /proc/self/mountinfo'
 
-  echo "firewalls (one per container):"
+  echo "firewalls:"
   # Dropped packets time out (curl exit 28); without the firewall the closed
   # port would refuse the connection instead.
   check pass "claude: drops traffic other than to the proxy" claude \
     'curl -sS -o /dev/null -m 3 --noproxy "*" http://proxy:80; [ $? -eq 28 ]'
-  check pass "claude: Claude runs without capabilities" claude \
-    'grep -qE "^CapEff:\s+0+$" /proc/self/status && grep -qE "^CapBnd:\s+0+$" /proc/self/status'
-  check fail "claude: rules can't be changed from inside" claude 'nft add table inet probe'
   check pass "proxy: TCP 443 to public IPs allowed" proxy 'socat -T5 /dev/null TCP:1.1.1.1:443,connect-timeout=5'
   check fail "proxy: other ports blocked (TCP 53)" proxy 'socat -T5 /dev/null TCP:1.1.1.1:53,connect-timeout=5'
   check fail "devport: internet blocked" devport 'socat -T5 /dev/null TCP:1.1.1.1:443,connect-timeout=5'
@@ -242,6 +307,7 @@ Project:    $PROJECT_DIR
 Sandbox:    $ID
 Settings:   $INSTANCE_DIR/instance.env
 Dev server: http://$(instance_var DEV_BIND):$(instance_var DEV_PORT) -> port 5173 inside
+Toolchain:  $PROJECT_DIR/.sandbox/Dockerfile
 Allowlists: $TEMPLATE/proxy/allowlist.txt
             $PROJECT_DIR/.sandbox/allowlist.txt
 EOF
@@ -264,8 +330,9 @@ list() {
 
 remove() {
   if [[ $# -gt 0 ]]; then select_instance "$1"; else require_instance; fi
-  confirm "Delete sandbox $ID, including its Claude config and history?" || exit 1
+  confirm "Delete sandbox $ID, including its home directory and Claude's config?" || exit 1
   compose --progress quiet down --volumes --remove-orphans
+  docker image rm "claude-sandbox-claude:$ID" "claude-sandbox-toolchain:$ID" >/dev/null 2>&1 || true
   rm -rf -- "$INSTANCE_DIR"
   echo "Deleted $ID. The project's .sandbox/ directory was left in place."
 }
@@ -276,11 +343,11 @@ case "${1:-}" in
   claude)
     shift
     start
-    compose exec "${AS_NODE[@]}" claude --dangerously-skip-permissions "$@"
+    compose exec claude claude --dangerously-skip-permissions "$@"
     ;;
   shell)
     start
-    compose exec "${AS_NODE[@]}" bash
+    compose exec claude bash
     ;;
   up) start ;;
   down) require_instance && compose down ;;
@@ -294,10 +361,11 @@ case "${1:-}" in
   info) info ;;
   list) list ;;
   rm) shift && remove "$@" ;;
-  build) build_images ;;
+  build) build_shared_images ;;
   rebuild)
-    build_images --pull --no-cache
-    echo "Running sandboxes switch to the new images on their next start."
+    build_shared_images --pull --no-cache
+    rm -f "$INSTANCES"/*/image.stamp
+    echo "Each sandbox rebuilds its image on its next start."
     ;;
   *) usage ;;
 esac

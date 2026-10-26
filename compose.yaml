@@ -1,18 +1,24 @@
-# One sandbox instance. `sandbox` sets the compose project name per project
-# and supplies PROJECT_DIR, INSTANCE_DIR, DEV_PORT and DEV_BIND from
-# instances/<id>/instance.env.
+# One sandbox instance. `sandbox` sets the compose project name per project,
+# HOST_UID/HOST_GID, and PROJECT_DIR, INSTANCE_DIR, INSTANCE_ID, DEV_PORT and
+# DEV_BIND from instances/<id>/instance.env.
 #
-#   claude  -> only on the internal network (no route out); reaches the
-#              internet solely through the proxy's domain allowlist.
-#   proxy   -> Squid; bridges the internal and egress networks, allows
-#              CONNECT only to allowlisted domains.
-#   devport -> relays a published host port to the dev server inside claude.
+#   claude     -> the project's image (any base); runs Claude. Untrusted: its
+#                 user, capabilities and network are all fixed here.
+#   claude-net -> trusted; owns claude's network namespace on the internal
+#                 network (no route out) and loads its firewall.
+#   proxy      -> Squid; bridges the internal and egress networks, allows
+#                 CONNECT only to allowlisted domains.
+#   devport    -> relays a published host port to the dev server inside claude.
 #
-# Each container also loads its own nftables egress firewall at startup
-# (firewall/sandbox-init), then drops to an unprivileged user with no
-# capabilities. The capabilities added below exist only for that step.
+# The trusted containers (built from proxy/) load their own nftables egress
+# firewall at startup (firewall/sandbox-init), then drop to an unprivileged
+# user with no capabilities. The capabilities added below exist only for that.
 
 x-firewall: &firewall
+  image: claude-sandbox-proxy
+  pull_policy: never
+  restart: unless-stopped
+  read_only: true
   cap_drop: [ALL]
   cap_add: [NET_ADMIN, SETUID, SETGID, SETPCAP]
   security_opt: ["no-new-privileges:true"]
@@ -25,23 +31,28 @@ x-firewall: &firewall
 
 services:
   claude:
-    <<: *firewall
-    image: claude-sandbox-claude
+    image: claude-sandbox-claude:${INSTANCE_ID:?}
     pull_policy: never
-    hostname: sandbox
     init: true
+    entrypoint: ["sleep", "infinity"]
+    user: "${HOST_UID:?}:${HOST_GID:?}"
+    network_mode: service:claude-net
     depends_on:
+      claude-net:
+        condition: service_healthy
+        restart: true
       proxy:
         condition: service_healthy
-    networks: [internal]
+    working_dir: /workspace
     environment:
+      HOME: /home/sandbox
+      SHELL: /bin/bash
       HTTPS_PROXY: http://proxy:3128
       HTTP_PROXY: http://proxy:3128
       https_proxy: http://proxy:3128
       http_proxy: http://proxy:3128
       NO_PROXY: localhost,127.0.0.1
       no_proxy: localhost,127.0.0.1
-      CLAUDE_CONFIG_DIR: /home/node/.claude
       DISABLE_AUTOUPDATER: "1"
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
       # Passed through from .env only when set there.
@@ -51,11 +62,11 @@ services:
       - type: bind
         source: ${PROJECT_DIR:?}
         target: /workspace
-      # Read-only overlays. .sandbox holds the project's allowlist. All of
-      # .git, because git on the host executes what's in it (config can set
-      # core.fsmonitor, hooks run on commit); overlaying only config/hooks
-      # isn't enough, since .git itself could then be renamed and replaced.
-      # Being mount points, neither can be renamed or deleted from inside.
+      # Read-only overlays. .sandbox holds the project's allowlist and
+      # toolchain. All of .git, because git on the host executes what's in it
+      # (config can set core.fsmonitor, hooks run on commit); overlaying only
+      # config/hooks isn't enough, since .git itself could then be renamed
+      # and replaced. Being mount points, neither can be renamed or deleted.
       - type: bind
         source: ${PROJECT_DIR}/.sandbox
         target: /workspace/.sandbox
@@ -64,18 +75,27 @@ services:
         source: ${PROJECT_DIR}/.git
         target: /workspace/.git
         read_only: true
-      - claude-config:/home/node/.claude
+      # Claude's config and history, and dependency caches.
+      - home:/home/sandbox
     tmpfs:
       - /tmp
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     mem_limit: 8g
     cpus: 4
     pids_limit: 2048
 
+  claude-net:
+    <<: *firewall
+    hostname: sandbox
+    entrypoint: ["sandbox-init", "claude", "nobody"]
+    command: ["sleep", "infinity"]
+    networks: [internal]
+    mem_limit: 32m
+    pids_limit: 16
+
   proxy:
     <<: *firewall
-    image: claude-sandbox-proxy
-    pull_policy: never
-    restart: unless-stopped
     volumes:
       # Shared allowlist, plus this instance's approved copy of the project's.
       - type: bind
@@ -87,7 +107,6 @@ services:
         target: /etc/squid/instance
         read_only: true
     networks: [internal, egress]
-    read_only: true
     tmpfs:
       - /tmp
     mem_limit: 256m
@@ -95,15 +114,11 @@ services:
 
   devport:
     <<: *firewall
-    image: claude-sandbox-proxy
-    pull_policy: never
-    restart: unless-stopped
     entrypoint: ["sandbox-init", "devport", "nobody"]
-    command: ["socat", "TCP-LISTEN:5173,fork,reuseaddr", "TCP:claude:5173"]
+    command: ["socat", "TCP-LISTEN:5173,fork,reuseaddr", "TCP:claude-net:5173"]
     ports:
       - "${DEV_BIND:-127.0.0.1}:${DEV_PORT:?}:5173"
     networks: [internal, egress]
-    read_only: true
     mem_limit: 64m
     pids_limit: 128
 
@@ -115,4 +130,4 @@ networks:
     enable_ipv6: false
 
 volumes:
-  claude-config:
+  home:

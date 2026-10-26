@@ -1,0 +1,39 @@
+#!/bin/sh
+# Downloads the Claude Code binary for this architecture, in its glibc and
+# musl builds, to /opt/claude/{glibc,musl}/claude, verifying each against the
+# release manifest's checksum. Usage: fetch <latest|VERSION>
+set -eu
+
+base=https://downloads.claude.ai/claude-code-releases
+
+case $(uname -m) in
+  x86_64 | amd64) arch=x64 ;;
+  aarch64 | arm64) arch=arm64 ;;
+  *)
+    echo "fetch: unsupported architecture: $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+
+version=$1
+[ "$version" != latest ] || version=$(curl -fsSL "$base/latest")
+if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
+  echo "fetch: not a version: $version" >&2
+  exit 1
+fi
+manifest=$(curl -fsSL "$base/$version/manifest.json")
+
+for libc in glibc musl; do
+  platform=linux-$arch
+  [ "$libc" = glibc ] || platform=$platform-musl
+  checksum=$(printf '%s' "$manifest" | jq -r --arg p "$platform" '.platforms[$p].checksum // empty')
+  if [ -z "$checksum" ]; then
+    echo "fetch: $platform missing from the $version manifest" >&2
+    exit 1
+  fi
+  mkdir -p "/opt/claude/$libc"
+  curl -fsSL -o "/opt/claude/$libc/claude" "$base/$version/$platform/claude"
+  echo "$checksum  /opt/claude/$libc/claude" | sha256sum -c -
+  chmod 755 "/opt/claude/$libc/claude"
+done
+echo "$version" >/opt/claude/VERSION

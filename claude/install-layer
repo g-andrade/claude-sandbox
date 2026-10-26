@@ -1,0 +1,47 @@
+#!/bin/sh
+# Runs inside a project's toolchain image while building its sandbox image:
+# installs what Claude Code needs with whichever package manager the image
+# has, and adds an account for the host user.
+# Usage: install-layer <glibc|musl> <uid> <gid>
+set -eu
+
+libc=$1
+uid=$2
+gid=$3
+
+if command -v apt-get >/dev/null; then
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    bash ca-certificates curl git less procps ripgrep
+  rm -rf /var/lib/apt/lists/*
+elif command -v apk >/dev/null; then
+  # On musl, Claude Code also needs libgcc and libstdc++, and uses the
+  # system ripgrep.
+  apk add --no-cache bash ca-certificates curl git less procps ripgrep libgcc libstdc++
+elif command -v dnf >/dev/null || command -v microdnf >/dev/null; then
+  dnf=$(command -v dnf || command -v microdnf)
+  "$dnf" install -y bash ca-certificates git less procps-ng
+  command -v curl >/dev/null || "$dnf" install -y curl
+  # Not in every RHEL-family repo; on glibc Claude Code has its own copy.
+  "$dnf" install -y ripgrep || echo "install-layer: ripgrep unavailable, skipped" >&2
+  "$dnf" clean all
+else
+  echo "install-layer: the base image has none of apt, apk or dnf" >&2
+  exit 1
+fi
+
+if [ "$libc" = musl ] && ! command -v rg >/dev/null; then
+  echo "install-layer: musl images need ripgrep for Claude Code" >&2
+  exit 1
+fi
+
+# An account for the host UID, since some tools look the user up. It replaces
+# any image account with that UID; the GID keeps its existing group if any.
+sed -i "/^[^:]*:[^:]*:$uid:/d" /etc/passwd
+grep -q "^[^:]*:[^:]*:$gid:" /etc/group || echo "sandbox:x:$gid:" >>/etc/group
+echo "sandbox:x:$uid:$gid:sandbox:/home/sandbox:/bin/bash" >>/etc/passwd
+
+# Owned by the user so the per-sandbox home volume, initialised from this
+# directory, is writable.
+mkdir -p /home/sandbox
+chown "$uid:$gid" /home/sandbox
